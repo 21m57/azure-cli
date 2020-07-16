@@ -280,18 +280,71 @@ class AzCliCommandParser(CLICommandParser):
         self._namespace, self._raw_arguments = super().parse_known_args(args=args, namespace=namespace)
         return self._namespace, self._raw_arguments
 
+    def _search_in_extension_commands(self, command_str):
+        from azure.cli.core._session import EXT_CMD_INDEX
+        import os
+        # self.cli_ctx is None when self.prog is not 'az', such as 'az iot', use cli_ctx from cli_help which is not lost.
+        VALID_SECOND = 3600 * 24 * 10
+        EXT_CMD_INDEX.load(os.path.join((self.cli_ctx or self.cli_help.cli_ctx).config.config_dir, 'extCmdIndex.json'), VALID_SECOND)
+        if not EXT_CMD_INDEX.data:
+            import requests
+            from azure.cli.core.util import should_disable_connection_verify
+            response = requests.get('https://fengsa.blob.core.windows.net/index/extCmdIndex.json', verify=(not should_disable_connection_verify()))
+            if response.status_code == 200:
+                EXT_CMD_INDEX.data = response.json()
+                EXT_CMD_INDEX.save_with_retry()
+            else:
+                logger.info("Error when retrieveing extension command index. Response code:%s", response.status_code)
+                return None
+        cmd_chain = EXT_CMD_INDEX
+        for part in command_str.split():
+            try:
+                if isinstance(cmd_chain[part], str):
+                    return cmd_chain[part]
+                cmd_chain = cmd_chain[part]
+            except KeyError:
+                return None
+        return None
+
     def _check_value(self, action, value):
         # Override to customize the error message when a argument is not among the available choices
         # converted value must be one of the choices (if specified)
         if action.choices is not None and value not in action.choices:
             if not self.command_source:
-                # parser has no `command_source`, value is part of command itself
-                extensions_link = 'https://docs.microsoft.com/en-us/cli/azure/azure-cli-extensions-overview'
-                error_msg = ("{prog}: '{value}' is not in the '{prog}' command group. See '{prog} --help'. "
-                             "If the command is from an extension, "
-                             "please make sure the corresponding extension is installed. "
-                             "To learn more about extensions, please visit "
-                             "{extensions_link}").format(prog=self.prog, value=value, extensions_link=extensions_link)
+                # Check if the command is from an extension
+                from azure.cli.core.util import roughly_parse_command
+                cmd_list = self.prog.split() + self._raw_arguments
+                command_str = roughly_parse_command(cmd_list[1:])
+                ext_name = self._search_in_extension_commands(command_str)
+                if ext_name:
+                    telemetry.set_command_details(command_str,
+                        parameters=AzCliCommandInvoker._extract_parameter_names(cmd_list),  # pylint: disable=protected-access
+                        extension_name=ext_name)  # TODO add extension_version
+                    cli_ctx = self.cli_ctx or self.cli_help.cli_ctx
+                    ask_before_dynamic_extension_install = cli_ctx.config.getboolean('extension', 'ask_before_dynamic_extension_install', True)
+                    if ask_before_dynamic_extension_install:
+                        from knack.prompting import prompt_y_n
+                        go_on = prompt_y_n('You are running a command from the extension {}. Would you like to install it first?'.format(ext_name), default='y')
+                    else:
+                        logger.warning('You are running a command from the extension %s. It will be installed first.', ext_name)
+                        go_on = True
+                    if go_on:
+                        from azure.cli.core.extension.operations import add_extension
+                        add_extension(cli_ctx=cli_ctx, extension_name=ext_name)
+                        run_after_extension_installed = cli_ctx.config.getboolean('extension', 'run_after_extension_installed', True)
+                        if run_after_extension_installed:
+                            import subprocess
+                            exit_code = subprocess.call(cmd_list, shell=True)
+                            telemetry.set_user_fault("Extension {} dynamically installed and commands will be rerun automatically.".format(ext_name))
+                            self.exit(exit_code)
+                        else:
+                            error_msg = 'Extension installed. Please rerun your command.'
+                    else:
+                        error_msg = "Command failed due to corresponding extension not installed. Please run 'az extension add -n {}' first.".format(ext_name)
+                else:
+                    # parser has no `command_source`, value is part of command itself
+                    error_msg = ("{prog}: '{value}' is not in the '{prog}' command group. See '{prog} --help'. ").format(
+                        prog=self.prog, value=value)
             else:
                 # `command_source` indicates command values have been parsed, value is an argument
                 parameter = action.option_strings[0] if action.option_strings else action.dest
@@ -300,17 +353,18 @@ class AzCliCommandParser(CLICommandParser):
             telemetry.set_user_fault(error_msg)
             with CommandLoggerContext(logger):
                 logger.error(error_msg)
-            candidates = difflib.get_close_matches(value, action.choices, cutoff=0.7)
-            if candidates:
-                print_args = {
-                    's': 's' if len(candidates) > 1 else '',
-                    'verb': 'are' if len(candidates) > 1 else 'is',
-                    'value': value
-                }
-                self._suggestion_msg.append("\nThe most similar choice{s} to '{value}' {verb}:".format(**print_args))
-                self._suggestion_msg.append('\n'.join(['\t' + candidate for candidate in candidates]))
+            if not ext_name:
+                candidates = difflib.get_close_matches(value, action.choices, cutoff=0.7)
+                if candidates:
+                    print_args = {
+                        's': 's' if len(candidates) > 1 else '',
+                        'verb': 'are' if len(candidates) > 1 else 'is',
+                        'value': value
+                    }
+                    self._suggestion_msg.append("\nThe most similar choice{s} to '{value}' {verb}:".format(**print_args))
+                    self._suggestion_msg.append('\n'.join(['\t' + candidate for candidate in candidates]))
 
-            failure_recovery_recommendations = self._get_failure_recovery_recommendations(action)
-            self._suggestion_msg.extend(failure_recovery_recommendations)
-            self._print_suggestion_msg(sys.stderr)
+                failure_recovery_recommendations = self._get_failure_recovery_recommendations(action)
+                self._suggestion_msg.extend(failure_recovery_recommendations)
+                self._print_suggestion_msg(sys.stderr)
             self.exit(2)
