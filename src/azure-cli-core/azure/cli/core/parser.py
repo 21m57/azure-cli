@@ -319,9 +319,9 @@ class AzCliCommandParser(CLICommandParser):
                 error_msg = None
                 # self.cli_ctx is None when self.prog is beyond 'az', such as 'az iot'.
                 # use cli_ctx from cli_help which is not lost.
-                cli_ctx = self.cli_ctx or self.cli_help.cli_ctx
+                cli_ctx = self.cli_ctx or (self.cli_help.cli_ctx if self.cli_help else None)
                 use_dynamic_install = cli_ctx.config.get(
-                    'extension', 'use_dynamic_install', 'yes_prompt')
+                    'extension', 'use_dynamic_install', 'yes_prompt') if cli_ctx else 'no'
                 if use_dynamic_install.lower() != 'no' and not candidates:
                     # Check if the command is from an extension
                     from azure.cli.core.util import roughly_parse_command
